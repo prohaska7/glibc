@@ -286,14 +286,13 @@ def parse_c_expr(cur, op, loc, code, start):
 
     ATTRIBUTE = \
         r'((_*(attribute|ATTRIBUTE)_*(\s*\(\([^)]+\)\)|\w+))|weak_function)';
-    #ARGLIST = r'[\w\s\*]+' + ATTRIBUTE + '?,?\s*'
-    ARGLIST = r'(\w+[\s\*]+\w+' + ATTRIBUTE + '?,?\s*)|void'
 
     # Regular expressions.
     #
-    # Function or a macro call that doesn't need a semicolon: foo (args, ...)
-    # We later distinguish between the two by peeking into the next line.
-    func_re = re.compile(ATTRIBUTE + r'*\s*(\w+)\s*\((' + ARGLIST + ')*\)\s*{')
+    # The macrocall_re peeks into the next line to ensure that it doesn't eat up
+    # a FUNC by accident.  The func_re regex is also quite crude and only
+    # intends to ensure that the function name gets picked up correctly.
+    func_re = re.compile(ATTRIBUTE + r'*\s*(\w+)\s*\([^{]+\)\s*{')
     macrocall_re = re.compile(r'(\w+)\s*\(\w+(\s*,\s*[\w\.]+)*\)$')
     # Composite types such as structs and unions.
     composite_re = re.compile(r'(struct|union|enum)\s*(\w*)\s*{')
