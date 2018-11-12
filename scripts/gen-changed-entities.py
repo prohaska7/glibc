@@ -69,6 +69,36 @@ class block_type(Enum):
     assign = 12
 
 
+# Regular expressions.
+
+# The __attribute__ are written in a bunch of different ways in glibc.
+ATTRIBUTE = \
+        r'((_*(attribute|ATTRIBUTE)_*(\s*\(\([^)]+\)\)|\w+))|weak_function)';
+
+# Function regex
+FUNC_RE = re.compile(ATTRIBUTE + r'*\s*(\w+)\s*\([^(][^{]+\)\s*{')
+
+# The macrocall_re peeks into the next line to ensure that it doesn't eat up
+# a FUNC by accident.  The func_re regex is also quite crude and only
+# intends to ensure that the function name gets picked up correctly.
+MACROCALL_RE = re.compile(r'(\w+)\s*\(\w+(\s*,\s*[\w\.]+)*\)$')
+
+# Composite types such as structs and unions.
+COMPOSITE_RE = re.compile(r'(struct|union|enum)\s*(\w*)\s*{')
+
+# Static assignments.
+ASSIGN_RE = re.compile(r'(\w+)\s*(\[[^\]]*\])?\s*([^\s]*attribute[\s\w()]+)?\s*=')
+
+# Function Declarations. FIXME BROKEN
+FNDECL_RE = re.compile(r'(\w+)\s*\([^;]+\)\s*' + ATTRIBUTE + '*;')
+
+# Function pointer typedefs.
+TYPEDEF_FN_RE = re.compile(r'\(\*(\w+)\)\s*\([^)]+\);')
+
+# Simple decls.
+DECL_RE = re.compile(r'(\w+)(\[\w+\])?\s*' + ATTRIBUTE + '?;')
+
+
 def collapse_macros(op):
     # Consolidate macro defs across multiple lines.
     new_op = []
@@ -282,39 +312,18 @@ def parse_macrocall(name, cur, op, loc, code):
 def parse_c_expr(cur, op, loc, code, start):
     debug_print('PARSING: %s' % cur)
 
-    ATTRIBUTE = \
-        r'((_*(attribute|ATTRIBUTE)_*(\s*\(\([^)]+\)\)|\w+))|weak_function)';
-
-    # Regular expressions.
-    #
-    # The macrocall_re peeks into the next line to ensure that it doesn't eat up
-    # a FUNC by accident.  The func_re regex is also quite crude and only
-    # intends to ensure that the function name gets picked up correctly.
-    func_re = re.compile(ATTRIBUTE + r'*\s*(\w+)\s*\([^(][^{]+\)\s*{')
-    macrocall_re = re.compile(r'(\w+)\s*\(\w+(\s*,\s*[\w\.]+)*\)$')
-    # Composite types such as structs and unions.
-    composite_re = re.compile(r'(struct|union|enum)\s*(\w*)\s*{')
-    # Static assignments.
-    assign_re = re.compile(r'(\w+)\s*(\[[^\]]*\])?\s*([^\s]*attribute[\s\w()]+)?\s*=')
-    # Function Declarations. FIXME BROKEN
-    fndecl_re = re.compile(r'(\w+)\s*\([^;]+\)\s*' + ATTRIBUTE + '*;')
-    # Function pointer typedefs.
-    typedef_fn_re = re.compile(r'\(\*(\w+)\)\s*\([^)]+\);')
-    # Simple decls.
-    decl_re = re.compile(r'(\w+)(\[\w+\])?\s*' + ATTRIBUTE + '?;')
-
     # Composite type declarations.
-    found = re.search(composite_re, cur)
+    found = re.search(COMPOSITE_RE, cur)
     if found:
         return found, parse_composite(found.group(2), cur, op, loc, code)
 
     # Assignments.  This should cover struct and array assignments too.
-    found = re.search(assign_re, cur)
+    found = re.search(ASSIGN_RE, cur)
     if found:
         return found, parse_assign(found.group(1), cur, op, loc, code)
 
     # Typedefs.
-    found = re.search(typedef_fn_re, cur)
+    found = re.search(TYPEDEF_FN_RE, cur)
     if found:
         return found, parse_decl(found.group(1), cur, op, loc, code,
                 block_type.decl)
@@ -323,25 +332,25 @@ def parse_c_expr(cur, op, loc, code, start):
     # definitions, which have to account for any __attribute__ annotations
     # for its arguments.  With declarations, we just match the last closing
     # bracket and the semicolon following it.
-    found = re.search(fndecl_re, cur)
+    found = re.search(FNDECL_RE, cur)
     if found:
         return found, parse_decl(found.group(1), cur, op, loc, code,
                 block_type.fndecl)
 
     # Functions or macro calls that don't end with a semicolon.
-    found = re.search(func_re, cur)
+    found = re.search(FUNC_RE, cur)
     if found:
         return found, parse_func(found.group(5), cur, op, loc, code)
 
     # Functions or macro calls that don't end with a semicolon.  We need to peek
     # ahead to make sure that we don't mis-identify a function.  This happens
     # only with functions that take no arguments.
-    found = re.search(macrocall_re, cur)
+    found = re.search(MACROCALL_RE, cur)
     if found and (loc >= len(op) or '{' not in op[loc]):
         return found, parse_macrocall(found.group(1), cur, op, loc, code)
 
     # Finally, all declarations.
-    found = re.search(decl_re, cur)
+    found = re.search(DECL_RE, cur)
     if found:
         return found, parse_decl(found.group(1), cur, op, loc, code,
                 block_type.decl)
@@ -459,12 +468,13 @@ def exec_git_cmd(args):
     return cleaned(list(proc.stdout))
 
 
-def list_commits(revs):
-    ref = revs[0] + '..' + revs[1]
-    return exec_git_cmd(['log', '--pretty=%H', ref])
-
-
 def print_changed_tree(tree, action, prologue = ''):
+    ''' Print the nature of the differences found in the tree compared to the
+    other tree.  TREE is the tree that changed, action is what the change was
+    (Added, Removed, Modified) and prologue specifies the macro scope the change
+    is in.  The function calls itself recursively for all macro condition tree
+    nodes.
+    '''
 
     if tree['type'] != block_type.macro_cond:
         print('\t%s(%s): %s.' % (prologue, tree['name'], action))
@@ -535,6 +545,8 @@ def analyze_diff(oldfile, newfile, filename):
         return
 
     debug_print('\t<List diff between oldfile and newfile>')
+    # op = exec_git_cmd(['diff', '-U20000', oldfile, newfile])
+    # (left, right) = parse_output(op)
 
     left = parse_output(exec_git_cmd(['show', oldfile]))
     right = parse_output(exec_git_cmd(['show', newfile]))
@@ -640,6 +652,13 @@ def list_changes(commit):
             sys.exit(42)
 
     print('')
+
+
+def list_commits(revs):
+    ''' List commit IDs between the two revs in the REVS list.
+    '''
+    ref = revs[0] + '..' + revs[1]
+    return exec_git_cmd(['log', '--pretty=%H', ref])
 
 
 def main(revs):
