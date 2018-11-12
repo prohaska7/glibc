@@ -297,7 +297,7 @@ def parse_c_expr(cur, op, loc, code, start):
     # Composite types such as structs and unions.
     composite_re = re.compile(r'(struct|union|enum)\s*(\w*)\s*{')
     # Static assignments.
-    assign_re = re.compile(r'(\w+)\s*(\[\])?\s*([^\s]*attribute[\s\w()]+)?\s*=')
+    assign_re = re.compile(r'(\w+)\s*(\[[^\]]*\])?\s*([^\s]*attribute[\s\w()]+)?\s*=')
     # Function Declarations. FIXME BROKEN
     fndecl_re = re.compile(r'(\w+)\s*\([^;]+\)\s*' + ATTRIBUTE + '*;')
     # Function pointer typedefs.
@@ -464,7 +464,12 @@ def list_commits(revs):
 
 def analyze_diff(oldfile, newfile, filename):
     # Ignore non-C files.
-    if filename.find('.c') < 0 and filename.find('.h') < 0:
+    split = filename.split('.')
+    ext = ''
+    if split:
+        ext = split[-1]
+
+    if ext != 'c' and ext != 'h':
         return
 
     print('\t<List diff between oldfile and newfile>')
