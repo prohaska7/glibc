@@ -1,4 +1,48 @@
 #!/usr/bin/python3
+# Copyright (C) 2018 Free Software Foundation, Inc.
+# This file is part of the GNU C Library.
+#
+# The GNU C Library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# The GNU C Library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with the GNU C Library; if not, see
+# <http://www.gnu.org/licenses/>.
+''' Generate a ChangeLog style output based on the git log.
+
+This script takes two revisions as input and generates a ChangeLog style output
+for all revisions between the two revisions.  This output is intended to be an
+approximation and not the exact ChangeLog.
+
+At a high level, the script enumerates all C source files (*.c and *.h) and
+builds a tree of top level objects within macro conditionals.  The top level
+objects the script currently attempts to identify are:
+
+    - Include statements
+    - Macro definitions and undefs
+    - Declarations and definitions of variables and functions
+    - Composite types
+
+The script attempts to identify quirks typically used in glibc sources such as
+the symbol hack macro calls that don't use a semicolon and tries to adjust for
+them.
+
+Known Limitations:
+
+    - Does not identify changes in or to comments.  Comments are simply stripped
+      out.
+    - Weird nesting of macro conditionals may break things.  Attempts have been
+      made to try and maintain state across macro conditional scopes, but
+      there's still scope to fool the script.
+    - Does not identify changes within functions.
+'''
 import subprocess
 import sys
 import os
@@ -84,6 +128,19 @@ def remove_comments(op):
     return new_op
 
 
+def new_block(name, type, contents, parent):
+    block = {}
+    block['matched'] = False
+    block['name'] = name
+    block['type'] = type
+    block['contents'] = contents
+    block['parent'] = parent
+    if parent:
+        parent['contents'].append(block)
+
+    return block
+
+
 # Parse macros.
 def parse_macro(op, loc, code, start = '', else_start = ''):
     cur = op[loc]
@@ -104,80 +161,46 @@ def parse_macro(op, loc, code, start = '', else_start = ''):
     # Include file.
     if cur.find('include') == 0:
         m = re.search(r'include\s*["<]?([^">]+)[">]?', cur)
-        include = {}
-        include['name'] = m.group(1)
-        include['type'] = block_type.macro_include
-        include['contents'] = [cur]
-        include['parent'] = code
-        code['contents'].append(include)
+        new_block(m.group(1), block_type.macro_include, [cur], code)
 
     # Macro definition.
     if cur.find('define') == 0:
         m = re.search(r'define\s+([a-zA-Z0-9_]+)', cur)
-        macrodef = {}
-        macrodef['name'] = m.group(1)
-        macrodef['type'] = block_type.macro_def
-        macrodef['contents'] = [cur]
-        macrodef['parent'] = code
-        code['contents'].append(macrodef)
+        new_block(m.group(1), block_type.macro_def, [cur], code)
 
+    # Macro undef.
     if cur.find('undef') == 0:
         m = re.search(r'undef\s+([a-zA-Z0-9_]+)', cur)
-        macrodef = {}
-        macrodef['name'] = m.group(1)
-        macrodef['type'] = block_type.macro_undef
-        macrodef['contents'] = [cur]
-        macrodef['parent'] = code
-        code['contents'].append(macrodef)
+        new_block(m.group(1), block_type.macro_undef, [cur], code)
 
-    # Macro definition.
+    # #error and #warning macros.
     if cur.find('error') == 0 or cur.find('warning') == 0:
         m = re.search(r'(error|warning)\s+"?(.*)"?', cur)
         if m:
             name = m.group(2)
         else:
             name = '<blank>'
-        macrodef = {}
-        macrodef['name'] = name
-        macrodef['type'] = block_type.macro_info
-        macrodef['contents'] = [cur]
-        macrodef['parent'] = code
-        code['contents'].append(macrodef)
+        new_block(name, block_type.macro_info, [cur], code)
 
     # Start of an #if or #ifdef block.
     elif cur.find('if') == 0:
         rem = re.sub(r'ifndef', r'!', cur).strip()
         rem = re.sub(r'(ifdef|defined|if)', r'', rem).strip()
-        ifdef = {}
-        ifdef['name'] = rem
-        ifdef['type'] = block_type.macro_cond
-        ifdef['contents'] = []
-        ifdef['parent'] = code
-        code['contents'].append(ifdef)
+        ifdef = new_block(rem, block_type.macro_cond, [], code)
         loc = parse(op, loc, ifdef, start)
 
     # End the previous #if/#elif and begin a new block.
     elif cur.find('elif') == 0 and code['parent']:
         rem = re.sub(r'(elif|defined)', r'', cur).strip()
-        ifdef = {}
-        ifdef['name'] = rem
-        ifdef['type'] = block_type.macro_cond
-        ifdef['contents'] = []
-        ifdef['parent'] = code['parent']
-        # Here's the key thing: The #else block should go into the current
-        # block's parent.
-        code['parent']['contents'].append(ifdef)
+        # The #else and #elif blocks should go into the current block's parent.
+        ifdef = new_block(rem, block_type.macro_cond, [], code['parent'])
         loc = parse(op, loc, ifdef, else_start)
         endblock = True
 
     # End the previous #if/#elif and begin a new block.
     elif cur.find('else') == 0 and code['parent']:
-        ifdef = {}
-        ifdef['name'] = '!(' + code['name'] + ')'
-        ifdef['type'] = block_type.macro_cond
-        ifdef['contents'] = []
-        ifdef['parent'] = code['parent']
-        code['parent']['contents'].append(ifdef)
+        name = '!(' + code['name'] + ')'
+        ifdef = new_block(name, block_type.macro_cond, [], code['parent'])
         loc = parse(op, loc, ifdef, else_start)
         endblock = True
 
@@ -204,12 +227,7 @@ def fast_forward_scope(cur, op, loc, open='{', close='}'):
 # Different types of declarations.
 def parse_decl(name, cur, op, loc, code, blocktype):
     debug_print('FOUND DECL: %s' % name)
-    block = {}
-    block['name'] = name
-    block['type'] = blocktype
-    block['contents'] = [cur]
-    block['parent'] = code
-    code['contents'].append(block)
+    new_block(name, blocktype, [cur], code)
 
     return loc
 
@@ -222,12 +240,7 @@ def parse_assign(name, cur, op, loc, code):
         cur = op[loc]
         loc = loc + 1
 
-    block = {}
-    block['name'] = name
-    block['type'] = block_type.assign
-    block['contents'] = [cur]
-    block['parent'] = code
-    code['contents'].append(block)
+    new_block(name, block_type.assign, [cur], code)
 
     return loc
 
@@ -240,12 +253,7 @@ def parse_composite(name, cur, op, loc, code):
     # Lap up all of the struct definition.
     (cur, loc) = fast_forward_scope(cur, op, loc)
 
-    block = {}
-    block['name'] = name
-    block['type'] = block_type.composite
-    block['contents'] = [cur]
-    block['parent'] = code
-    code['contents'].append(block)
+    new_block(name, block_type.composite, [cur], code)
 
     return loc
 
@@ -257,12 +265,7 @@ def parse_func(name, cur, op, loc, code):
     # Consume everything up to the ending brace of the function.
     (cur, loc) = fast_forward_scope(cur, op, loc)
 
-    block = {}
-    block['name'] = name
-    block['type'] = block_type.func
-    block['contents'] = [cur]
-    block['parent'] = code
-    code['contents'].append(block)
+    new_block(name, block_type.func, [cur], code)
 
     return loc
 
@@ -271,12 +274,7 @@ def parse_func(name, cur, op, loc, code):
 def parse_macrocall(name, cur, op, loc, code):
     debug_print('FOUND MACROCALL: %s' % name)
 
-    block = {}
-    block['name'] = name
-    block['type'] = block_type.macrocall
-    block['contents'] = [cur]
-    block['parent'] = code
-    code['contents'].append(block)
+    new_block(name, block_type.macrocall, [cur], code)
 
     return loc
 
@@ -292,7 +290,7 @@ def parse_c_expr(cur, op, loc, code, start):
     # The macrocall_re peeks into the next line to ensure that it doesn't eat up
     # a FUNC by accident.  The func_re regex is also quite crude and only
     # intends to ensure that the function name gets picked up correctly.
-    func_re = re.compile(ATTRIBUTE + r'*\s*(\w+)\s*\([^{]+\)\s*{')
+    func_re = re.compile(ATTRIBUTE + r'*\s*(\w+)\s*\([^(][^{]+\)\s*{')
     macrocall_re = re.compile(r'(\w+)\s*\(\w+(\s*,\s*[\w\.]+)*\)$')
     # Composite types such as structs and unions.
     composite_re = re.compile(r'(struct|union|enum)\s*(\w*)\s*{')
@@ -392,6 +390,9 @@ def parse(op, loc, code, start = ''):
 
 
 def print_tree(tree, indent):
+    if not debug:
+        return
+
     if tree['type'] == block_type.macro_cond or tree['type'] == block_type.file:
         print('%sScope: %s' % (' ' * indent, tree['name']))
         for c in tree['contents']:
@@ -452,7 +453,7 @@ def cleaned(ip):
 
 def exec_git_cmd(args):
     args.insert(0, 'git')
-    print(args)
+    debug_print(args)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE)
 
     return cleaned(list(proc.stdout))
@@ -462,8 +463,69 @@ def list_commits(revs):
     ref = revs[0] + '..' + revs[1]
     return exec_git_cmd(['log', '--pretty=%H', ref])
 
+
+def print_changed_tree(tree, action, prologue = ''):
+
+    if tree['type'] != block_type.macro_cond:
+        print('\t%s(%s): %s.' % (prologue, tree['name'], action))
+        return
+
+    prologue = '%s[%s]' % (prologue, tree['name'])
+    for t in tree['contents']:
+        if t['type'] == block_type.macro_cond:
+            print_changed_tree(t, action, prologue)
+        else:
+            print('\t%s(%s): %s.' % (prologue, t['name'], action))
+
+
+def compare_trees(left, right, prologue = ''):
+    ''' Compare two trees and print the difference.
+
+    This routine is the entry point to compare two trees and print out their
+    differences.  LEFT and RIGHT will always have the same name and type,
+    starting with block_type.file and '' at the top level.
+    '''
+
+    if left['type'] == block_type.macro_cond or left['type'] == block_type.file:
+
+        if left['type'] == block_type.macro_cond:
+            prologue = '%s[%s]' % (prologue, left['name'])
+
+        # TODO 1: There must be some list comprehension magic I can do here.
+        # TODO 2: This won't detect when the macro condition has been changed.
+        # It will think of one condition as added and another as removed.  We'll
+        # have to live with that for now.
+
+        # Make sure that everything in the left tree exists in the right tree.
+        for cl in left['contents']:
+            found = False
+            for cr in right['contents']:
+                if not cl['matched'] and not cr['matched'] and \
+                        cl['name'] == cr['name'] and cl['type'] == cr['type']:
+                    cl['matched'] = cr['matched'] = True
+                    compare_trees(cl, cr, prologue)
+                    found = True
+                    break
+            if not found:
+                print_changed_tree(cl, 'Removed', prologue)
+
+        # ... and vice versa.  This time we only need to look at unmatched
+        # contents.
+        for cr in right['contents']:
+            if not cr['matched']:
+                print_changed_tree(cr, 'New', prologue)
+    else:
+        if left['contents'] != right['contents']:
+            print_changed_tree(left, 'Modified', prologue)
+
+
 def analyze_diff(oldfile, newfile, filename):
-    # Ignore non-C files.
+    ''' Parse the output of the old and new files and print the difference.
+
+    For input files OLDFILE and NEWFILE with name FILENAME, generate reduced
+    trees for them and compare them.  We limit our comparison to only C source
+    files.
+    '''
     split = filename.split('.')
     ext = ''
     if split:
@@ -472,26 +534,29 @@ def analyze_diff(oldfile, newfile, filename):
     if ext != 'c' and ext != 'h':
         return
 
-    print('\t<List diff between oldfile and newfile>')
+    debug_print('\t<List diff between oldfile and newfile>')
 
     left = parse_output(exec_git_cmd(['show', oldfile]))
     right = parse_output(exec_git_cmd(['show', newfile]))
 
-    print('LEFT TREE')
-    print('-' * 80)
+    compare_trees(left, right)
+
+    debug_print('LEFT TREE')
+    debug_print('-' * 80)
     print_tree(left, 0)
-    print('RIGHT TREE')
-    print('-' * 80)
+    debug_print('RIGHT TREE')
+    debug_print('-' * 80)
     print_tree(right, 0)
 
 
 def parse_output(op):
-    tree = {}
-    tree['name'] = ''
-    tree['type'] = block_type.file
-    tree['contents'] = []
-    tree['parent'] = None
-    #op = preprocess(op, right)
+    ''' File parser.
+
+    Parse the input array of lines OP and generate a tree structure to
+    represent the file.  This tree structure is then used for comparison between
+    the old and new file.
+    '''
+    tree = new_block('', block_type.file, [], None)
     op = remove_comments(op)
     op = parse(op, 0, tree)
 
@@ -499,6 +564,13 @@ def parse_output(op):
 
 
 def list_changes(commit):
+    ''' List changes in a single commit.
+
+    For the input commit id COMMIT, identify the files that have changed and the
+    nature of their changes.  Print commit information in the ChangeLog format,
+    calling into helper functions as necessary.
+    '''
+
     op = exec_git_cmd(['show', '--date=short', '--raw', commit])
     author = ''
     date = ''
@@ -571,12 +643,16 @@ def list_changes(commit):
 
 
 def main(revs):
+    ''' ChangeLog Generator Entry Point
+    '''
     commits = list_commits(revs)
     for commit in commits:
         list_changes(commit)
 
 
 def parser_file_test(f):
+    ''' Parser debugger Entry Point
+    '''
     with open(f) as srcfile:
         op = srcfile.readlines()
         op = [x[:-1] for x in op]
@@ -584,11 +660,13 @@ def parser_file_test(f):
         print_tree(tree, 0)
 
 
+# Program Entry point.  If -d is specified, the second argument is assumed to be
+# a file and only the parser is run in verbose mode.
 if __name__ == '__main__':
     if len(sys.argv) != 3:
         usage(sys.argv[0])
 
-    if sys.argv[1] == '-t':
+    if sys.argv[1] == '-d':
         debug = True
         parser_file_test(sys.argv[2])
     else:
