@@ -47,14 +47,78 @@ import subprocess
 import sys
 import os
 import re
-
-#------------------------------------------------------------------------------
-# C Parser.
-#------------------------------------------------------------------------------
 from enum import Enum
+
+# General Utility functions.
+def eprint(*args, **kwargs):
+    ''' Print to stderr.
+    '''
+    print(*args, file=sys.stderr, **kwargs)
+
+
 debug = False
+def debug_print(*args, **kwargs):
+    ''' Convenience function to print diagnostic information in the program.
+    '''
+    if debug:
+        eprint(*args, **kwargs)
+
+
+def usage(name):
+    ''' Print program usage.
+    '''
+    eprint("usage: %s <from-ref> <to-ref>" % name)
+    sys.exit(os.EX_USAGE)
+
+
+def decode(string):
+    ''' Attempt to decode a string.
+
+    Decode a string read from the source file.  The multiple attempts are needed
+    due to the presence of the page break characters and some tests in locales.
+    '''
+    codecs = ['utf8', 'latin1', 'cp1252']
+
+    for i in codecs:
+        try:
+            return string.decode(i)
+        except UnicodeDecodeError:
+            pass
+
+    eprint('Failed to decode: %s' % string)
+
+
+def new_block(name, type, contents, parent):
+    '''  Create a new code block with the parent as PARENT.
+
+    The code block is a basic structure around which the tree representation of
+    the source code is built.  It has the following attributes:
+
+    - type: Any one of the following types in BLOCK_TYPE.
+    - name: A name to refer it by in the ChangeLog
+    - contents: The contents of the block.  For a block of types file or
+      macro_cond, this would be a list of blocks that it nests.  For other types
+      it is a list with a single string specifying its contents.
+    - parent: This is the parent of the current block, useful in setting up
+      #elif or #else blocks in the tree.
+    - matched: A flag to specify if the block in a tree has found a match in the
+      other tree to which it is being compared.
+    '''
+    block = {}
+    block['matched'] = False
+    block['name'] = name
+    block['type'] = type
+    block['contents'] = contents
+    block['parent'] = parent
+    if parent:
+        parent['contents'].append(block)
+
+    return block
+
 
 class block_type(Enum):
+    ''' Type of code block.
+    '''
     file = 1
     macro_cond = 2
     macro_def = 3
@@ -69,6 +133,9 @@ class block_type(Enum):
     assign = 12
 
 
+#------------------------------------------------------------------------------
+# C Parser.
+#------------------------------------------------------------------------------
 # Regular expressions.
 
 # The __attribute__ are written in a bunch of different ways in glibc.
@@ -89,7 +156,7 @@ COMPOSITE_RE = re.compile(r'(struct|union|enum)\s*(\w*)\s*{')
 # Static assignments.
 ASSIGN_RE = re.compile(r'(\w+)\s*(\[[^\]]*\])?\s*([^\s]*attribute[\s\w()]+)?\s*=')
 
-# Function Declarations. FIXME BROKEN
+# Function Declarations.
 FNDECL_RE = re.compile(r'(\w+)\s*\([^;]+\)\s*' + ATTRIBUTE + '*;')
 
 # Function pointer typedefs.
@@ -99,94 +166,46 @@ TYPEDEF_FN_RE = re.compile(r'\(\*(\w+)\)\s*\([^)]+\);')
 DECL_RE = re.compile(r'(\w+)(\[\w+\])?\s*' + ATTRIBUTE + '?;')
 
 
-def collapse_macros(op):
-    # Consolidate macro defs across multiple lines.
-    new_op = []
-    cur_line = ''
-    join_line = False
-    for l in op:
-        if join_line:
-            cur_line = cur_line[:-1] + ' ' + l
-        else:
-            cur_line = l
-
-        if cur_line[0] == '#' and cur_line[-1] == '\\':
-            join_line = True
-            continue
-        else:
-            join_line = False
-
-        new_op.append(cur_line)
-
-    return new_op
-
-
 def remove_comments(op):
-    new_op = []
+    ''' Remove comments.
 
-    # The simpler one-line comments.
-    for l in op:
-        # FIXME: This assumes that there's always only one comment per line.
-        rem = re.sub(r'/\*.*\*/', r'', l)
-        if rem:
-            new_op.append(rem.strip())
+    Return OP by removing all comments from it.
+    '''
+    debug_print('REMOVE COMMENTS')
 
-    op = new_op
-    new_op = []
-
-    in_comment = False
-    for l in op:
-        if in_comment:
-            loc = l.find('*/')
-            if loc == -1:
-                continue
-            else:
-                in_comment = False
-                rem = l[loc + 2:]
-                if rem:
-                    new_op.append(rem)
-        else:
-            loc = l.find('/*')
-            if loc == -1:
-                new_op.append(l)
-            else:
-                in_comment = True
-                rem = l[:loc]
-                if rem:
-                    new_op.append(rem)
+    sep='\n'
+    opstr = sep.join(op)
+    opstr = re.sub(r'/\*.*?\*/', r'', opstr, flags=re.MULTILINE | re.DOTALL)
+    opstr = re.sub(r'\\\n', r' ', opstr, flags=re.MULTILINE | re.DOTALL)
+    new_op = list(filter(None, opstr.split(sep)))
 
     return new_op
-
-
-def new_block(name, type, contents, parent):
-    block = {}
-    block['matched'] = False
-    block['name'] = name
-    block['type'] = type
-    block['contents'] = contents
-    block['parent'] = parent
-    if parent:
-        parent['contents'].append(block)
-
-    return block
 
 
 # Parse macros.
-def parse_macro(op, loc, code, start = '', else_start = ''):
+def parse_preprocessor(op, loc, code, start = '', else_start = ''):
+    ''' Parse a preprocessor directive.
+
+    In case a preprocessor condition (i.e. if/elif/else), create a new code
+    block to nest code into and in other cases, identify and add entities suchas
+    include files, defines, etc.
+
+    - NAME is the name of the directive
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - LOC is the first unread location in CUR
+    - CODE is the block to which we add this function
+
+    - Returns: The next location to be read in the array.
+    '''
     cur = op[loc]
     loc = loc + 1
     endblock = False
 
     debug_print('PARSE_MACRO: %s' % cur)
 
-    # Collapse the macro into a single line.
-    while cur[-1] == '\\':
-        cur = cur[:-1] + ' ' + op[loc]
-        loc = loc + 1
-
-
     # Remove the # and strip spaces again.
-    cur = cur[1:].strip()
+    cur = cur[1:]
 
     # Include file.
     if cur.find('include') == 0:
@@ -242,13 +261,26 @@ def parse_macro(op, loc, code, start = '', else_start = ''):
 
 # Given the start of a scope CUR, lap up all code up to the end of scope
 # indicated by the closing brace.
-def fast_forward_scope(cur, op, loc, open='{', close='}'):
-    nesting = cur.count(open) - cur.count(close)
+def fast_forward_scope(cur, op, loc):
+    ''' Consume lines in a code block.
+
+    Consume all lines of a block of code such as a composite type declaration or
+    a function declaration.
+
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - LOC is the first unread location in CUR
+
+    - Returns: The next location to be read in the array as well as the updated
+      value of CUR, which will now have the body of the function or composite
+      type.
+    '''
+    nesting = cur.count('{') - cur.count('}')
     while nesting > 0 and loc < len(op):
         cur = cur + ' ' + op[loc]
 
-        nesting = nesting + op[loc].count(open)
-        nesting = nesting - op[loc].count(close)
+        nesting = nesting + op[loc].count('{')
+        nesting = nesting - op[loc].count('}')
         loc = loc + 1
 
     return (cur, loc)
@@ -256,6 +288,18 @@ def fast_forward_scope(cur, op, loc, open='{', close='}'):
 
 # Different types of declarations.
 def parse_decl(name, cur, op, loc, code, blocktype):
+    ''' Parse a top level declaration.
+
+    All types of declarations except function declarations.
+
+    - NAME is the name of the declarated entity
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - LOC is the first unread location in CUR
+    - CODE is the block to which we add this function
+
+    - Returns: The next location to be read in the array.
+    '''
     debug_print('FOUND DECL: %s' % name)
     new_block(name, blocktype, [cur], code)
 
@@ -263,142 +307,187 @@ def parse_decl(name, cur, op, loc, code, blocktype):
 
 
 # Assignments.
-def parse_assign(name, cur, op, loc, code):
+def parse_assign(name, cur, op, loc, code, blocktype):
+    ''' Parse an assignment statement.
+
+    This includes array assignments.
+
+    - NAME is the name of the assigned entity
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - LOC is the first unread location in CUR
+    - CODE is the block to which we add this
+
+    - Returns: The next location to be read in the array.
+    '''
     debug_print('FOUND ASSIGN: %s' % name)
     # Lap up everything up to semicolon.
     while ';' not in cur and loc < len(op):
         cur = op[loc]
         loc = loc + 1
 
-    new_block(name, block_type.assign, [cur], code)
+    new_block(name, blocktype, [cur], code)
 
     return loc
 
 
-# Structs or unions.
-def parse_composite(name, cur, op, loc, code):
+def parse_composite(name, cur, op, loc, code, blocktype):
+    ''' Parse a composite type.
+
+    Match declaration of a composite type such as a sruct or a union..
+
+    - NAME is the name of the composite type
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - LOC is the first unread location in CUR
+    - CODE is the block to which we add this
+
+    - Returns: The next location to be read in the array.
+    '''
     if not name:
         name = '<anonymous>'
 
     # Lap up all of the struct definition.
     (cur, loc) = fast_forward_scope(cur, op, loc)
 
-    new_block(name, block_type.composite, [cur], code)
+    new_block(name, blocktype, [cur], code)
 
     return loc
 
 
-# Parse a function.  NAME is the function name.
-def parse_func(name, cur, op, loc, code):
+def parse_func(name, cur, op, loc, code, blocktype):
+    ''' Parse a function.
+
+    Match a function definition.
+
+    - NAME is the name of the function
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - LOC is the first unread location in CUR
+    - CODE is the block to which we add this
+
+    - Returns: The next location to be read in the array.
+    '''
     debug_print('FOUND FUNC: %s' % name)
 
     # Consume everything up to the ending brace of the function.
     (cur, loc) = fast_forward_scope(cur, op, loc)
 
-    new_block(name, block_type.func, [cur], code)
+    new_block(name, blocktype, [cur], code)
 
     return loc
 
 
-# Parse a function.  NAME is the function name.
-def parse_macrocall(name, cur, op, loc, code):
+def parse_macrocall(name, cur, op, loc, code, blocktype):
+    ''' Parse a macro call.
+
+    Match a symbol hack macro calls that get added without semicolons.
+
+    - NAME is the name of the macro call
+    - CUR is the string array for the file
+    - CUR is the string to consume this expression from
+    - OP is the string array for the file
+    - CODE is the block to which we add this
+
+    - Returns: The next location to be read in the array.
+    '''
     debug_print('FOUND MACROCALL: %s' % name)
 
-    new_block(name, block_type.macrocall, [cur], code)
+    new_block(name, blocktype, [cur], code)
 
     return loc
 
 
-def parse_c_expr(cur, op, loc, code, start):
+c_expr_parsers = [
+        {'regex' : COMPOSITE_RE, 'func' : parse_composite, 'name' : 2,
+            'type' : block_type.composite},
+        {'regex' : ASSIGN_RE, 'func' : parse_assign, 'name' : 1,
+            'type' : block_type.assign},
+        {'regex' : TYPEDEF_FN_RE, 'func' : parse_decl, 'name' : 1,
+            'type' : block_type.decl},
+        {'regex' : FNDECL_RE, 'func' : parse_decl, 'name' : 1,
+            'type' : block_type.fndecl},
+        {'regex' : FUNC_RE, 'func' : parse_func, 'name' : 5,
+            'type' : block_type.func},
+        {'regex' : MACROCALL_RE, 'func' : parse_macrocall, 'name' : 1,
+            'type' : block_type.macrocall},
+        {'regex' : DECL_RE, 'func' : parse_decl, 'name' : 1,
+            'type' : block_type.decl}]
+
+
+def parse_c_expr(cur, op, loc, code):
+    ''' Parse a C expression.
+
+    CUR is the string to be parsed, which continues to grow until a match is
+    found.  OP is the string array and LOC is the first unread location in the
+    string array.  CODE is the block in which any identified expressions should
+    be added.
+    '''
     debug_print('PARSING: %s' % cur)
 
-    # Composite type declarations.
-    found = re.search(COMPOSITE_RE, cur)
-    if found:
-        return found, parse_composite(found.group(2), cur, op, loc, code)
+    # TODO: There's probably a quicker way to do this.
+    for p in c_expr_parsers:
+        found = re.search(p['regex'], cur)
+        if found:
+            return '', p['func'](found.group(p['name']), cur, op, loc, code,
+                                    p['type'])
 
-    # Assignments.  This should cover struct and array assignments too.
-    found = re.search(ASSIGN_RE, cur)
-    if found:
-        return found, parse_assign(found.group(1), cur, op, loc, code)
-
-    # Typedefs.
-    found = re.search(TYPEDEF_FN_RE, cur)
-    if found:
-        return found, parse_decl(found.group(1), cur, op, loc, code,
-                block_type.decl)
-
-    # Function declarations are pretty straightforward compared to function
-    # definitions, which have to account for any __attribute__ annotations
-    # for its arguments.  With declarations, we just match the last closing
-    # bracket and the semicolon following it.
-    found = re.search(FNDECL_RE, cur)
-    if found:
-        return found, parse_decl(found.group(1), cur, op, loc, code,
-                block_type.fndecl)
-
-    # Functions or macro calls that don't end with a semicolon.
-    found = re.search(FUNC_RE, cur)
-    if found:
-        return found, parse_func(found.group(5), cur, op, loc, code)
-
-    # Functions or macro calls that don't end with a semicolon.  We need to peek
-    # ahead to make sure that we don't mis-identify a function.  This happens
-    # only with functions that take no arguments.
-    found = re.search(MACROCALL_RE, cur)
-    if found and (loc >= len(op) or '{' not in op[loc]):
-        return found, parse_macrocall(found.group(1), cur, op, loc, code)
-
-    # Finally, all declarations.
-    found = re.search(DECL_RE, cur)
-    if found:
-        return found, parse_decl(found.group(1), cur, op, loc, code,
-                block_type.decl)
-
-    return found, loc
+    return cur, loc
 
 
-# Parse the file line by line.  The function assumes a mostly GNU coding
-# standard compliant input so it might barf with anything that is eligible for
-# the Obfuscated C code contest.
-#
-# The basic idea of the parser is to identify macro conditional scopes and
-# definitions, includes, etc. and then parse the remaining C code in the context
-# of those macro scopes.  The parser does not try to understand the semantics of
-# the code or even validate its syntax.  It only records high level symbols in
-# the source and makes a tree structure to indicate the declaration/definition
-# of those symbols and their scope in the macro definitions.
-#
-# LOC is the first unparsed line.
 def parse(op, loc, code, start = ''):
+    '''
+    Parse the file line by line.  The function assumes a mostly GNU coding
+    standard compliant input so it might barf with anything that is eligible for
+    the Obfuscated C code contest.
+
+    The basic idea of the parser is to identify macro conditional scopes and
+    definitions, includes, etc. and then parse the remaining C code in the
+    context of those macro scopes.  The parser does not try to understand the
+    semantics of the code or even validate its syntax.  It only records high
+    level symbols in the source and makes a tree structure to indicate the
+    declaration/definition of those symbols and their scope in the macro
+    definitions.
+
+    LOC is the first unparsed line.
+    '''
     cur = start
     endblock = False
 
     while loc < len(op):
-        nextline = op[loc].strip()
-
-        if not nextline:
-            loc = loc + 1
-            continue
+        nextline = op[loc]
 
         # Macros.
         if nextline[0] == '#':
-            (loc, endblock) = parse_macro(op, loc, code, cur, start)
+            (loc, endblock) = parse_preprocessor(op, loc, code, cur, start)
             if endblock and not cur:
                 return loc
         # Rest of C Code.
         else:
             cur = cur + ' ' + nextline
-            found, loc = parse_c_expr(cur, op, loc + 1, code, cur)
-            if found:
-                cur = ''
-            if endblock:
-                return loc
+            cur, loc = parse_c_expr(cur, op, loc + 1, code)
 
     return loc
 
 
+def parse_output(op):
+    ''' File parser.
+
+    Parse the input array of lines OP and generate a tree structure to
+    represent the file.  This tree structure is then used for comparison between
+    the old and new file.
+    '''
+    tree = new_block('', block_type.file, [], None)
+    op = remove_comments(op)
+    op = [re.sub(r'#\s+', '#', x) for x in op]
+    op = parse(op, 0, tree)
+
+    return tree
+
+
 def print_tree(tree, indent):
+    ''' Print the entire tree.
+    '''
     if not debug:
         return
 
@@ -432,40 +521,19 @@ def print_tree(tree, indent):
 #------------------------------------------------------------------------------
 
 
-def debug_print(*args, **kwargs):
-    if debug:
-        print(*args, file=sys.stderr, **kwargs)
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
-
-def usage(name):
-    eprint("usage: %s <from-ref> <to-ref>" % name)
-    sys.exit(os.EX_USAGE)
-
-def decode(string):
-    codecs = ['utf8', 'latin1', 'cp1252']
-
-    for i in codecs:
-        try:
-            return string.decode(i)
-        except UnicodeDecodeError:
-            pass
-
-    eprint('Failed to decode: %s' % string)
-
-def cleaned(ip):
-    # Returns the output from a command after cleaning it up, i.e. removing
-    # trailing spaces, newlines and dropping blank lines.
-    op = list(filter(None, [decode(x[:-1]).strip() for x in ip]))
-    return op
-
 def exec_git_cmd(args):
+    ''' Execute a git command and return its result as a list of strings
+    '''
     args.insert(0, 'git')
     debug_print(args)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE)
 
-    return cleaned(list(proc.stdout))
+    # Clean up the output by removing trailing spaces, newlines and dropping
+    # blank lines.
+    op = [decode(x[:-1]).strip() for x in proc.stdout]
+    op = [re.sub(r'\s+', ' ', x) for x in op]
+    op = [x for x in op if x]
+    return op
 
 
 def print_changed_tree(tree, action, prologue = ''):
@@ -561,20 +629,6 @@ def analyze_diff(oldfile, newfile, filename):
     print_tree(right, 0)
 
 
-def parse_output(op):
-    ''' File parser.
-
-    Parse the input array of lines OP and generate a tree structure to
-    represent the file.  This tree structure is then used for comparison between
-    the old and new file.
-    '''
-    tree = new_block('', block_type.file, [], None)
-    op = remove_comments(op)
-    op = parse(op, 0, tree)
-
-    return tree
-
-
 def list_changes(commit):
     ''' List changes in a single commit.
 
@@ -603,8 +657,8 @@ def list_changes(commit):
             break
 
     # Find raw commit information for all non-ChangeLog files.
-    op = [x[1:] for x in op
-            if len(x) > 0 and x[0] == ':' and x.find('ChangeLog') == -1]
+    op = [x[1:] for x in op if len(x) > 0 and re.match(r'^:[0-9]+', x) \
+            and 'ChangeLog' not in x]
 
     # It was only the ChangeLog, ignore.
     if len(op) == 0:
