@@ -678,29 +678,41 @@ def list_changes(commit):
     # where OPERATION can be one of the following:
     # A: File added
     # D: File removed
-    # M: File modified
+    # M[0-9]{3}: File modified
     # R[0-9]{3}: File renamed, with the 3 digit number following it indicating
     # what percentage of the file is intact.
+    # C[0-9]{3}: File copied.  Same semantics as R.
+    # T: The permission bits of the file changed
+    # U: Unmerged.  We should not encounter this, so we ignore it/
+    # X, or anything else: Most likely a bug.  Report it.
     #
-    # FILE2 is set only when OPERATION is R, to indicate the new file name.
+    # FILE2 is set only when OPERATION is R or C, to indicate the new file name.
     #
     # Also note that merge commits have a different format here, with three
     # entries each for the modes and refs, but we don't bother with it for now.
+    #
+    # For more details: https://git-scm.com/docs/diff-format
     for f in op:
         data = f.split()
         if data[4] == 'A':
             print('\t* %s: New file.' % data[5])
         elif data[4] == 'D':
             print('\t* %s: Delete file.' % data[5])
-        elif data[4] == 'M':
+        elif data[4] == 'T':
+            print('\t* %s: Changed file permission bits from %s to %s' % \
+                    (data[5], data[0], data[1]))
+        elif data[4][0] == 'M':
             print('\t* %s: Modified.' % data[5])
             analyze_diff(data[2], data[3], data[5])
-        elif data[4][0] == 'R':
+        elif data[4][0] == 'R' or data[4][0] == 'C':
             change = int(data[4][1:])
             print('\t* %s: Move to...' % data[5])
             print('\t* %s: ... here.' % data[6])
             if change < 100:
                 analyze_diff(data[2], data[3], data[6])
+        # We should never encounter this, so ignore for now.
+        elif data[4] == 'U':
+            pass
         else:
             eprint('%s: Unknown line format %s' % (commit, data[4]))
             sys.exit(42)
