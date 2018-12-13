@@ -102,7 +102,13 @@ __pthread_rwlock_tryrdlock (pthread_rwlock_t *rwlock)
 	 overwrite the value set by the most recent writer (or the readers
 	 before it in case of explicit hand-over) and we know that there
 	 are no waiting readers.  */
-      atomic_store_relaxed (&rwlock->__data.__wrphase_futex, 0);
+      /* TODO update above comment */
+      if ((atomic_exchange_relaxed (&rwlock->__data.__wrphase_futex, 0)
+          & PTHREAD_RWLOCK_FUTEX_USED) != 0)
+        {
+          int private = __pthread_rwlock_get_private (rwlock);
+          futex_wake (&rwlock->__data.__wrphase_futex, INT_MAX, private);
+        }
     }
 
   return 0;
