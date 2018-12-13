@@ -47,7 +47,8 @@ __pthread_rwlock_trywrlock (pthread_rwlock_t *rwlock)
 	  r | PTHREAD_RWLOCK_WRPHASE | PTHREAD_RWLOCK_WRLOCKED))
 	{
 	  atomic_store_relaxed (&rwlock->__data.__writers_futex, 1);
-	  atomic_store_relaxed (&rwlock->__data.__wrphase_futex, 1);
+          if ((r & PTHREAD_RWLOCK_WRPHASE) == 0)
+              atomic_store_relaxed (&rwlock->__data.__wrphase_futex, 1);
 	  atomic_store_relaxed (&rwlock->__data.__cur_writer,
 	      THREAD_GETMEM (THREAD_SELF, tid));
 	  return 0;
